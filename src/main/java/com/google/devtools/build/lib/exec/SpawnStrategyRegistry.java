@@ -1,0 +1,539 @@
+// Copyright 2018 The Bazel Authors. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+package com.google.devtools.build.lib.exec;
+
+import static java.util.stream.Collectors.joining;
+
+import com.google.auto.value.AutoValue;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Joiner;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableCollection;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableListMultimap;
+import com.google.common.collect.ImmutableMultimap;
+import com.google.common.collect.LinkedListMultimap;
+import com.google.common.collect.ListMultimap;
+import com.google.common.collect.Lists;
+import com.google.common.flogger.GoogleLogger;
+import com.google.devtools.build.lib.actions.ActionContext;
+import com.google.devtools.build.lib.actions.ActionExecutionMetadata;
+import com.google.devtools.build.lib.actions.DynamicStrategyRegistry;
+import com.google.devtools.build.lib.actions.SandboxedSpawnStrategy;
+import com.google.devtools.build.lib.actions.Spawn;
+import com.google.devtools.build.lib.actions.SpawnStrategy;
+import com.google.devtools.build.lib.events.Event;
+import com.google.devtools.build.lib.events.EventHandler;
+import com.google.devtools.build.lib.events.Reporter;
+import com.google.devtools.build.lib.server.FailureDetails;
+import com.google.devtools.build.lib.server.FailureDetails.ExecutionOptions.Code;
+import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
+import com.google.devtools.build.lib.util.AbruptExitException;
+import com.google.devtools.build.lib.util.DetailedExitCode;
+import com.google.devtools.build.lib.util.RegexFilter;
+import com.google.errorprone.annotations.CanIgnoreReturnValue;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import javax.annotation.Nullable;
+
+/**
+ * Registry that collects spawn strategies and rules about their applicability and makes them
+ * available for querying through various registry interfaces.
+ *
+ * <p>An instance of this registry can be created using its {@linkplain Builder builder}, which is
+ * available to Blaze modules during server startup.
+ */
+public final class SpawnStrategyRegistry
+    implements DynamicStrategyRegistry, ActionContext, RemoteLocalFallbackRegistry {
+  private static final GoogleLogger logger = GoogleLogger.forEnclosingClass();
+
+  private final ImmutableListMultimap<String, SpawnStrategy> mnemonicToStrategies;
+  private final ImmutableListMultimap<RegexFilter, SpawnStrategy> filterToStrategies;
+  private final ImmutableList<? extends SpawnStrategy> defaultStrategies;
+  private final ImmutableMultimap<String, SandboxedSpawnStrategy> mnemonicToRemoteDynamicStrategies;
+  private final ImmutableMultimap<String, SandboxedSpawnStrategy> mnemonicToLocalDynamicStrategies;
+  @Nullable private final AbstractSpawnStrategy remoteLocalFallbackStrategy;
+
+  private SpawnStrategyRegistry(
+      ImmutableListMultimap<String, SpawnStrategy> mnemonicToStrategies,
+      ImmutableListMultimap<RegexFilter, SpawnStrategy> filterToStrategies,
+      ImmutableList<? extends SpawnStrategy> defaultStrategies,
+      ImmutableMultimap<String, SandboxedSpawnStrategy> mnemonicToRemoteDynamicStrategies,
+      ImmutableMultimap<String, SandboxedSpawnStrategy> mnemonicToLocalDynamicStrategies,
+      @Nullable AbstractSpawnStrategy remoteLocalFallbackStrategy) {
+    this.mnemonicToStrategies = mnemonicToStrategies;
+    this.filterToStrategies = filterToStrategies;
+    this.defaultStrategies = defaultStrategies;
+    this.mnemonicToRemoteDynamicStrategies = mnemonicToRemoteDynamicStrategies;
+    this.mnemonicToLocalDynamicStrategies = mnemonicToLocalDynamicStrategies;
+    this.remoteLocalFallbackStrategy = remoteLocalFallbackStrategy;
+    logger.atInfo().log("Default strategies: %s", defaultStrategies);
+    logger.atInfo().log("Filter strategies: %s", filterToStrategies);
+    logger.atInfo().log("Mnemonic strategies: %s", mnemonicToStrategies);
+    logger.atInfo().log("Remote strategies: %s", mnemonicToRemoteDynamicStrategies);
+    logger.atInfo().log("Local strategies: %s", mnemonicToLocalDynamicStrategies);
+    logger.atInfo().log("Fallback strategies: %s", remoteLocalFallbackStrategy);
+  }
+
+  /**
+   * Returns the strategies applying to the given spawn, in priority order.
+   *
+   * <p>Which strategies are returned is based on the precedence as documented on the construction
+   * methods of {@linkplain Builder this registry's builder}.
+   *
+   * <p>If the reason for selecting the context is worth mentioning to the user, logs a message
+   * using the given {@link Reporter}.
+   */
+  @VisibleForTesting
+  public List<? extends SpawnStrategy> getStrategies(Spawn spawn, EventHandler reporter) {
+    return getStrategies(spawn.getResourceOwner(), spawn.getMnemonic(), reporter);
+  }
+
+  public List<? extends SpawnStrategy> getStrategies(
+      @Nullable ActionExecutionMetadata resourceOwner,
+      String mnemonic,
+      @Nullable EventHandler reporter) {
+    // Don't override test strategies by --strategy_regexp for backwards compatibility.
+    if (resourceOwner != null && !"TestRunner".equals(mnemonic)) {
+      String description = resourceOwner.getProgressMessage();
+      if (description != null) {
+        for (Map.Entry<RegexFilter, Collection<SpawnStrategy>> filterStrategies :
+            filterToStrategies.asMap().entrySet()) {
+          if (filterStrategies.getKey().isIncluded(description)) {
+            // TODO(schmitt): Why is this done here and not after running canExec?
+            if (reporter != null) {
+              reporter.handle(
+                  Event.progress(description + " with context " + filterStrategies.getValue()));
+            }
+            return ImmutableList.copyOf(filterStrategies.getValue());
+          }
+        }
+      }
+    }
+    if (mnemonicToStrategies.containsKey(mnemonic)) {
+      return mnemonicToStrategies.get(mnemonic);
+    }
+    return defaultStrategies;
+  }
+
+  @Override
+  public void notifyUsedDynamic(ActionContext.ActionContextRegistry actionContextRegistry) {
+    for (SandboxedSpawnStrategy strategy : mnemonicToLocalDynamicStrategies.values()) {
+      strategy.usedContext(actionContextRegistry);
+    }
+    for (SandboxedSpawnStrategy strategy : mnemonicToRemoteDynamicStrategies.values()) {
+      strategy.usedContext(actionContextRegistry);
+    }
+  }
+
+  @Override
+  public ImmutableCollection<SandboxedSpawnStrategy> getDynamicSpawnActionContexts(
+      Spawn spawn, DynamicMode dynamicMode) {
+    ImmutableMultimap<String, SandboxedSpawnStrategy> mnemonicToDynamicStrategies =
+        dynamicMode == DynamicStrategyRegistry.DynamicMode.REMOTE
+            ? mnemonicToRemoteDynamicStrategies
+            : mnemonicToLocalDynamicStrategies;
+    if (mnemonicToDynamicStrategies.containsKey(spawn.getMnemonic())) {
+      return mnemonicToDynamicStrategies.get(spawn.getMnemonic());
+    }
+    if (mnemonicToDynamicStrategies.containsKey("")) {
+      return mnemonicToDynamicStrategies.get("");
+    }
+    return ImmutableList.of();
+  }
+
+  @Nullable
+  @Override
+  public AbstractSpawnStrategy getRemoteLocalFallbackStrategy() {
+    return remoteLocalFallbackStrategy;
+  }
+
+  /**
+   * Notifies all (non-dynamic) strategies stored in this registry that they are {@linkplain
+   * SpawnStrategy#usedContext used}.
+   */
+  public void notifyUsed(ActionContext.ActionContextRegistry actionContextRegistry) {
+    for (SpawnStrategy strategy : filterToStrategies.values()) {
+      strategy.usedContext(actionContextRegistry);
+    }
+    for (SpawnStrategy strategy : mnemonicToStrategies.values()) {
+      strategy.usedContext(actionContextRegistry);
+    }
+    for (SpawnStrategy strategy : defaultStrategies) {
+      strategy.usedContext(actionContextRegistry);
+    }
+    if (remoteLocalFallbackStrategy != null) {
+      remoteLocalFallbackStrategy.usedContext(actionContextRegistry);
+    }
+  }
+
+  /**
+   * Records the list of all spawn strategies that can be returned by the various query methods of
+   * this registry to the given reporter.
+   */
+  void logSpawnStrategies() {
+    for (Map.Entry<String, Collection<SpawnStrategy>> entry :
+        mnemonicToStrategies.asMap().entrySet()) {
+      logger.atInfo().log(
+          "MnemonicToStrategyImplementations: \"%s\" = [%s]",
+          entry.getKey(), toImplementationNames(entry.getValue()));
+    }
+
+    for (Map.Entry<RegexFilter, Collection<SpawnStrategy>> entry :
+        filterToStrategies.asMap().entrySet()) {
+      Collection<SpawnStrategy> value = entry.getValue();
+      logger.atInfo().log(
+          "FilterToStrategyImplementations: \"%s\" = [%s]",
+          entry.getKey(), toImplementationNames(value));
+    }
+
+    logger.atInfo().log(
+        "DefaultStrategyImplementations: [%s]", toImplementationNames(defaultStrategies));
+
+    if (remoteLocalFallbackStrategy != null) {
+      logger.atInfo().log(
+          "RemoteLocalFallbackImplementation: [%s]",
+          remoteLocalFallbackStrategy.getClass().getSimpleName());
+    }
+
+    for (Map.Entry<String, Collection<SandboxedSpawnStrategy>> entry :
+        mnemonicToRemoteDynamicStrategies.asMap().entrySet()) {
+      logger.atInfo().log(
+          "MnemonicToRemoteDynamicStrategyImplementations: \"%s\" = [%s]",
+          entry.getKey(), toImplementationNames(entry.getValue()));
+    }
+
+    for (Map.Entry<String, Collection<SandboxedSpawnStrategy>> entry :
+        mnemonicToLocalDynamicStrategies.asMap().entrySet()) {
+      logger.atInfo().log(
+          "MnemonicToLocalDynamicStrategyImplementations: \"%s\" = [%s]",
+          entry.getKey(), toImplementationNames(entry.getValue()));
+    }
+  }
+
+  private static String toImplementationNames(Collection<?> strategies) {
+    return strategies.stream()
+        .map(strategy -> strategy.getClass().getSimpleName())
+        .collect(joining(", "));
+  }
+
+  /** Returns a new {@link Builder} suitable for creating instances of SpawnStrategyRegistry. */
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  /**
+   * Builder collecting the strategies and restrictions thereon for a {@link SpawnStrategyRegistry}.
+   *
+   * <p>To {@linkplain SpawnStrategyRegistry#getStrategies match a strategy to a spawn} it needs to
+   * be both {@linkplain #registerStrategy registered} and its registered command-line identifier
+   * has to match {@linkplain #addDescriptionFilter a filter on the spawn's progress message},
+   * {@linkplain #addMnemonicFilter a filter on the spawn's mnemonic} or be part of the default
+   * strategies (see below).
+   *
+   * <p><strong>Default strategies</strong> are either {@linkplain #setDefaultStrategies set
+   * explicitly} or, if {@link #setDefaultStrategies} is not called on this builder, comprised of
+   * all registered strategies, in registration order (i.e. the earliest strategy registered will be
+   * first in the list of strategies returned by {@link SpawnStrategyRegistry#getStrategies}).
+   */
+  public static final class Builder {
+
+    private final HashMap<String, SpawnStrategy> identifierToStrategy = new HashMap<>();
+    private final ArrayList<SpawnStrategy> strategiesInRegistrationOrder = new ArrayList<>();
+
+    private ImmutableList<String> explicitDefaultStrategies = ImmutableList.of();
+
+    // TODO(schmitt): Using a list and autovalue so as to be able to reverse order while legacy sort
+    //  is supported. Can be converted to same as mnemonics once legacy behavior is removed.
+    private final List<FilterAndIdentifiers> filterAndIdentifiers = new ArrayList<>();
+    // Using List values here rather than multimaps as there is no need for the latter's
+    // functionality: The values are always replaced as a whole, no adding/creation required.
+    private final HashMap<String, List<String>> mnemonicToIdentifiers = new HashMap<>();
+    private final HashMap<String, List<String>> mnemonicToRemoteDynamicIdentifiers =
+        new HashMap<>();
+    private final HashMap<String, List<String>> mnemonicToLocalDynamicIdentifiers = new HashMap<>();
+
+    @Nullable private String remoteLocalFallbackStrategyIdentifier;
+
+    /**
+     * Adds a filter limiting any spawn whose {@linkplain
+     * com.google.devtools.build.lib.actions.ActionExecutionMetadata#getProgressMessage() owner's
+     * progress message} matches the regular expression to only use strategies with the given
+     * command-line identifiers, in order.
+     *
+     * <p>If multiple filters match the same spawn (including an identical filter) the order of last
+     * applicable filter registered by this method will be used.
+     */
+    @CanIgnoreReturnValue
+    public Builder addDescriptionFilter(RegexFilter filter, List<String> identifiers) {
+      filterAndIdentifiers.add(
+          new AutoValue_SpawnStrategyRegistry_FilterAndIdentifiers(
+              filter, ImmutableList.copyOf(identifiers)));
+      return this;
+    }
+
+    /**
+     * Adds a filter limiting any spawn whose {@linkplain Spawn#getMnemonic() mnemonic}
+     * (case-sensitively) matches the given mnemonic to only use strategies with the given
+     * command-line identifiers, in order.
+     *
+     * <p>If the same mnemonic is registered multiple times the last such call will take precedence.
+     *
+     * <p>Note that if a spawn matches a {@linkplain #addDescriptionFilter registered description
+     * filter} that filter will take precedence over any mnemonic-based filters.
+     */
+    // last one wins
+    @CanIgnoreReturnValue
+    public Builder addMnemonicFilter(String mnemonic, List<String> identifiers) {
+      mnemonicToIdentifiers.put(mnemonic, identifiers);
+      return this;
+    }
+
+    /**
+     * Registers a strategy implementation with this collector, distinguishing it from other
+     * strategies with the given command-line identifiers (of which at least one is required).
+     *
+     * <p>If multiple strategies are registered with the same command-line identifier the last one
+     * so registered will take precedence.
+     */
+    @CanIgnoreReturnValue
+    public Builder registerStrategy(SpawnStrategy strategy, String... commandlineIdentifiers) {
+      Preconditions.checkArgument(
+          commandlineIdentifiers.length >= 1, "At least one commandLineIdentifier must be given");
+      for (String identifier : commandlineIdentifiers) {
+        identifierToStrategy.put(identifier, strategy);
+      }
+      strategiesInRegistrationOrder.add(strategy);
+      return this;
+    }
+
+    /**
+     * Explicitly sets the identifiers of default strategies to use if a spawn matches no filters.
+     *
+     * <p>Note that if this method is not called on the builder, all registered strategies are
+     * considered default strategies, in registration order. See also the {@linkplain Builder class
+     * documentation}.
+     */
+    @CanIgnoreReturnValue
+    public Builder setDefaultStrategies(List<String> defaultStrategies) {
+      // Ensure there are actual strategies and the contents are not empty.
+      Preconditions.checkArgument(!defaultStrategies.isEmpty());
+      Preconditions.checkArgument(
+          defaultStrategies.stream().anyMatch(strategy -> !"".equals(strategy)));
+      this.explicitDefaultStrategies = ImmutableList.copyOf(defaultStrategies);
+      return this;
+    }
+
+    /**
+     * Reset the default strategies (see {@link #setDefaultStrategies}) to the reverse of the order
+     * they were registered in.
+     */
+    @CanIgnoreReturnValue
+    public Builder resetDefaultStrategies() {
+      this.explicitDefaultStrategies = ImmutableList.of();
+      return this;
+    }
+
+    /**
+     * Sets the strategy names to use in the remote branch of dynamic execution for a set of action
+     * mnemonics.
+     *
+     * <p>During execution, each strategy is {@linkplain SpawnStrategy#canExec(Spawn,
+     * ActionContextRegistry) asked} whether it can execute a given Spawn. The first strategy in the
+     * list that says so will get the job.
+     */
+    @CanIgnoreReturnValue
+    public Builder addDynamicRemoteStrategies(Map<String, List<String>> strategies) {
+      mnemonicToRemoteDynamicIdentifiers.putAll(strategies);
+      return this;
+    }
+
+    /**
+     * Sets the strategy names to use in the local branch of dynamic execution for a number of
+     * action mnemonics.
+     *
+     * <p>During execution, each strategy is {@linkplain SpawnStrategy#canExec(Spawn,
+     * ActionContextRegistry) asked} whether it can execute a given Spawn. The first strategy in the
+     * list that says so will get the job.
+     */
+    @CanIgnoreReturnValue
+    public Builder addDynamicLocalStrategies(Map<String, List<String>> strategies) {
+      mnemonicToLocalDynamicIdentifiers.putAll(strategies);
+      return this;
+    }
+
+    /**
+     * Sets the commandline identifier of the strategy to be used when falling back from remote to
+     * local execution.
+     *
+     * <p>Note that this is an optional setting, if not provided {@link
+     * SpawnStrategyRegistry#getRemoteLocalFallbackStrategy()} will return {@code null}. If the
+     * value <b>is</b> provided it must match the commandline identifier of a registered strategy
+     * (at {@linkplain #build build} time).
+     */
+    @CanIgnoreReturnValue
+    public Builder setRemoteLocalFallbackStrategyIdentifier(String commandlineIdentifier) {
+      this.remoteLocalFallbackStrategyIdentifier = commandlineIdentifier;
+      return this;
+    }
+
+    /**
+     * Finalizes the construction of the registry.
+     *
+     * @throws AbruptExitException if a strategy command-line identifier was used in a filter or the
+     *     default strategies but no strategy for that identifier was registered
+     */
+    public SpawnStrategyRegistry build() throws AbruptExitException {
+      List<FilterAndIdentifiers> orderedFilterAndIdentifiers = Lists.reverse(filterAndIdentifiers);
+
+      ListMultimap<RegexFilter, SpawnStrategy> filterToStrategies = LinkedListMultimap.create();
+      for (FilterAndIdentifiers filterAndIdentifier : orderedFilterAndIdentifiers) {
+        RegexFilter filter = filterAndIdentifier.filter();
+        if (!filterToStrategies.containsKey(filter)) {
+          filterToStrategies.putAll(
+              filter, toStrategies(filterAndIdentifier.identifiers(), filter));
+        }
+      }
+
+      ImmutableListMultimap.Builder<String, SpawnStrategy> mnemonicToStrategies =
+          new ImmutableListMultimap.Builder<>();
+      for (Map.Entry<String, List<String>> entry : mnemonicToIdentifiers.entrySet()) {
+        mnemonicToStrategies.putAll(
+            entry.getKey(), toStrategies(entry.getValue(), "mnemonic " + entry.getKey()));
+      }
+
+      ImmutableListMultimap.Builder<String, SandboxedSpawnStrategy> mnemonicToLocalStrategies =
+          new ImmutableListMultimap.Builder<>();
+      for (Map.Entry<String, List<String>> entry : mnemonicToLocalDynamicIdentifiers.entrySet()) {
+        mnemonicToLocalStrategies.putAll(
+            entry.getKey(),
+            toSandboxedStrategies(entry.getValue(), "local mnemonic " + entry.getKey()));
+      }
+
+      ImmutableListMultimap.Builder<String, SandboxedSpawnStrategy> mnemonicToRemoteStrategies =
+          new ImmutableListMultimap.Builder<>();
+      for (Map.Entry<String, List<String>> entry : mnemonicToRemoteDynamicIdentifiers.entrySet()) {
+        mnemonicToRemoteStrategies.putAll(
+            entry.getKey(),
+            toSandboxedStrategies(entry.getValue(), "remote mnemonic " + entry.getKey()));
+      }
+
+      AbstractSpawnStrategy remoteLocalFallbackStrategy = null;
+      if (remoteLocalFallbackStrategyIdentifier != null) {
+        SpawnStrategy strategy =
+            toStrategy(remoteLocalFallbackStrategyIdentifier, "remote fallback strategy");
+        if (!(strategy instanceof AbstractSpawnStrategy)) {
+          // TODO(schmitt): Check if all strategies can use the same base and remove check if so.
+          throw createExitException(
+              String.format(
+                  "'%s' was requested for the remote fallback strategy but is not an"
+                      + " abstract spawn strategy (which is required for remote"
+                      + " fallback execution).",
+                  strategy.getClass().getSimpleName()),
+              Code.REMOTE_FALLBACK_STRATEGY_NOT_ABSTRACT_SPAWN);
+        }
+
+        remoteLocalFallbackStrategy = (AbstractSpawnStrategy) strategy;
+      }
+
+      ImmutableList<? extends SpawnStrategy> defaultStrategies;
+      if (explicitDefaultStrategies.isEmpty()) {
+        // Use the strategies as registered, in reverse order.
+        defaultStrategies = ImmutableList.copyOf(Lists.reverse(strategiesInRegistrationOrder));
+      } else {
+        defaultStrategies = toStrategies(explicitDefaultStrategies, "default strategies");
+      }
+
+      return new SpawnStrategyRegistry(
+          mnemonicToStrategies.build(),
+          ImmutableListMultimap.copyOf(filterToStrategies),
+          defaultStrategies,
+          mnemonicToRemoteStrategies.build(),
+          mnemonicToLocalStrategies.build(),
+          remoteLocalFallbackStrategy);
+    }
+
+    private ImmutableList<? extends SpawnStrategy> toStrategies(
+        List<String> identifiers, Object requestName) throws AbruptExitException {
+      ImmutableList.Builder<SpawnStrategy> strategies = ImmutableList.builder();
+      for (String identifier : identifiers) {
+        if (identifier.isEmpty()) {
+          continue;
+        }
+        strategies.add(toStrategy(identifier, requestName));
+      }
+      return strategies.build();
+    }
+
+    @VisibleForTesting
+    public SpawnStrategy toStrategy(String identifier, Object requestName)
+        throws AbruptExitException {
+      SpawnStrategy strategy = identifierToStrategy.get(identifier);
+      if (strategy == null) {
+        throw createExitException(
+            String.format(
+                "'%s' was requested for %s but no strategy with that identifier was registered. "
+                    + "Valid values are: [%s]",
+                identifier, requestName, Joiner.on(", ").join(identifierToStrategy.keySet())),
+            Code.STRATEGY_NOT_FOUND);
+      }
+      return strategy;
+    }
+
+    private Iterable<? extends SandboxedSpawnStrategy> toSandboxedStrategies(
+        List<String> identifiers, Object requestName) throws AbruptExitException {
+      Iterable<? extends SpawnStrategy> strategies = toStrategies(identifiers, requestName);
+      for (SpawnStrategy strategy : strategies) {
+        if (!(strategy instanceof SandboxedSpawnStrategy)) {
+          throw createExitException(
+              String.format(
+                  "'%s' was requested for %s but is not a sandboxed strategy (which is required for"
+                      + " dynamic execution).",
+                  strategy.getClass().getSimpleName(), requestName),
+              Code.DYNAMIC_STRATEGY_NOT_SANDBOXED);
+        }
+      }
+
+      @SuppressWarnings("unchecked") // Each element of the iterable was checked to fulfil this.
+      Iterable<? extends SandboxedSpawnStrategy> sandboxedStrategies =
+          (Iterable<? extends SandboxedSpawnStrategy>) strategies;
+      return sandboxedStrategies;
+    }
+  }
+
+  public ImmutableListMultimap<String, SpawnStrategy> getMnemonicToStrategies() {
+    return mnemonicToStrategies;
+  }
+
+  private static AbruptExitException createExitException(String message, Code detailedCode) {
+    return new AbruptExitException(
+        DetailedExitCode.of(
+            FailureDetail.newBuilder()
+                .setMessage(message)
+                .setExecutionOptions(
+                    FailureDetails.ExecutionOptions.newBuilder().setCode(detailedCode))
+                .build()));
+  }
+
+  @AutoValue
+  abstract static class FilterAndIdentifiers {
+
+    abstract RegexFilter filter();
+
+    abstract ImmutableList<String> identifiers();
+  }
+}
